@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"strings"
@@ -29,8 +30,11 @@ import (
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/projectcalico/cni-plugin/types"
 	"github.com/projectcalico/cni-plugin/utils"
+	"github.com/projectcalico/libcalico-go/lib/apiconfig"
 	api "github.com/projectcalico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/libcalico-go/lib/backend"
 	k8sconversion "github.com/projectcalico/libcalico-go/lib/backend/k8s/conversion"
+	"github.com/projectcalico/libcalico-go/lib/backend/model"
 	calicoclient "github.com/projectcalico/libcalico-go/lib/clientv3"
 	cerrors "github.com/projectcalico/libcalico-go/lib/errors"
 	cnet "github.com/projectcalico/libcalico-go/lib/net"
@@ -40,6 +44,35 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
+
+const (
+	blockSize = 64
+)
+
+type ipVersion struct {
+	Number            int
+	TotalBits         int
+	BlockPrefixLength int
+	BlockPrefixMask   net.IPMask
+}
+
+var ipv4 ipVersion = ipVersion{
+	Number:            4,
+	TotalBits:         32,
+	BlockPrefixLength: 26,
+	BlockPrefixMask:   net.CIDRMask(26, 32),
+}
+
+var ipv6 ipVersion = ipVersion{
+	Number:            6,
+	TotalBits:         128,
+	BlockPrefixLength: 122,
+	BlockPrefixMask:   net.CIDRMask(122, 128),
+}
+
+type allocationBlock struct {
+	*model.AllocationBlock
+}
 
 // CmdAddK8s performs the "ADD" operation on a kubernetes pod
 // Having kubernetes code in its own file avoids polluting the mainline code. It's expected that the kubernetes case will
@@ -228,7 +261,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 
 		// When ipAddrs annotation is set, we call out to the configured IPAM plugin
 		// requesting the specific IP addresses included in the annotation.
-		result, err = ipAddrsResult(ipAddrs, conf, args, logger)
+		result, err = ipAddrsResult(ctx, ipAddrs, conf, args, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -401,12 +434,21 @@ func releaseIPAddrs(ipAddrs []string, calico calicoclient.Interface, logger *log
 // ipAddrsResult parses the ipAddrs annotation and calls the configured IPAM plugin for
 // each IP passed to it by setting the IP field in CNI_ARGS, and returns the result of calling the IPAM plugin.
 // Example annotation value string: "[\"10.0.0.1\", \"2001:db8::1\"]"
-func ipAddrsResult(ipAddrs string, conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*current.Result, error) {
+func ipAddrsResult(ctx context.Context, ipAddrs string, conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*current.Result, error) {
 	logger.Infof("Parsing annotation \"cni.projectcalico.org/ipAddrs\":%s", ipAddrs)
 
 	// We need to make sure there is only one IPv4 and/or one IPv6
 	// passed in, since CNI spec only supports one of each right now.
 	ipList, err := validateAndExtractIPs(ipAddrs, "cni.projectcalico.org/ipAddrs", logger)
+	if err != nil {
+		return nil, err
+	}
+	// NOTE: check if there is a allocable ip
+	clientConfig, err := apiconfig.LoadClientConfig("")
+	if err != nil {
+		return nil, err
+	}
+	client, err := backend.NewClient(*clientConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -417,14 +459,46 @@ func ipAddrsResult(ipAddrs string, conf types.NetConf, args *skel.CmdArgs, logge
 	// for each, and populate the result variable with IP4 and/or IP6 IPs returned
 	// from the IPAM plugin.
 	for _, ip := range ipList {
+		logger.Infof("Probe if ip:%s is not inused", ip)
+		cip := cnet.IP{IP: ip}
+		blockCIDR := getBlockCIDRForAddress(cip)
+		obj, err := client.Get(ctx, model.BlockKey{blockCIDR}, "")
+		foundBlock := true
+		if err != nil {
+			foundBlock = false
+			if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
+				logger.WithError(err).Error("Error getting block")
+				return nil, err
+			}
+		}
+		if foundBlock {
+			block := allocationBlock{obj.Value.(*model.AllocationBlock)}
+			// Convert to an ordinal.
+			ordinal, err := ipToOrdinal(cip, block)
+			if err != nil {
+				return nil, err
+			}
+
+			// Check if already allocated.
+			if block.Allocations[ordinal] != nil {
+				logger.Infof("Address already assigned in block, %s", ip)
+				continue
+			}
+		}
+
 		// Call callIPAMWithIP with the ip address.
 		r, err := callIPAMWithIP(ip, conf, args, logger)
 		if err != nil {
-			return nil, fmt.Errorf("error getting IP from IPAM: %s", err)
+			logger.Debugf("error getting IP from IPAM: %s", err)
+			continue
 		}
 
 		result.IPs = append(result.IPs, r.IPs[0])
 		logger.Debugf("Adding IPv%s: %s to result", r.IPs[0].Version, ip.String())
+		break
+	}
+	if len(result.IPs) != 1 {
+		return nil, fmt.Errorf("no available ips")
 	}
 
 	return &result, nil
@@ -559,7 +633,6 @@ func validateAndExtractIPs(ipAddrs string, annotation string, logger *logrus.Ent
 		return nil, fmt.Errorf("annotation \"%s\" specified but empty", annotation)
 	}
 
-	var hasIPv4, hasIPv6 bool
 	var ipList []net.IP
 
 	// We need to make sure there is only one IPv4 and/or one IPv6
@@ -570,21 +643,14 @@ func validateAndExtractIPs(ipAddrs string, annotation string, logger *logrus.Ent
 			logger.WithField("IP", ip).Error("Invalid IP format")
 			return nil, fmt.Errorf("invalid IP format: %s", ip)
 		}
-
-		if ipAddr.To4() != nil {
-			if hasIPv4 {
-				// Check if there is already has been an IPv4 in the list, as we only support one IPv4 and/or one IPv6 per interface for now.
-				return nil, fmt.Errorf("cannot have more than one IPv4 address for \"%s\" annotation", annotation)
-			}
-			hasIPv4 = true
-		} else {
-			if hasIPv6 {
-				// Check if there is already has been an IPv6 in the list, as we only support one IPv4 and/or one IPv6 per interface for now.
-				return nil, fmt.Errorf("cannot have more than one IPv6 address for \"%s\" annotation", annotation)
-			}
-			hasIPv6 = true
+		if ipAddr.To4() == nil {
+			return nil, fmt.Errorf("currently only ipv4 is supported: %s", ip)
 		}
-
+		for _, _ip := range ipList {
+			if _ip.Equal(ipAddr) {
+				return nil, fmt.Errorf("cannot assign same ip: %s in annotation", ip)
+			}
+		}
 		// Append the IP to ipList slice.
 		ipList = append(ipList, ipAddr)
 	}
@@ -692,4 +758,34 @@ func getPodCidr(client *kubernetes.Clientset, conf types.NetConf, nodename strin
 		return "", fmt.Errorf("no podCidr for node %s", nodename)
 	}
 	return node.Spec.PodCIDR, nil
+}
+
+func getBlockCIDRForAddress(addr cnet.IP) cnet.IPNet {
+	var mask net.IPMask
+	if addr.Version() == 6 {
+		// This is an IPv6 address.
+		mask = ipv6.BlockPrefixMask
+	} else {
+		// This is an IPv4 address.
+		mask = ipv4.BlockPrefixMask
+	}
+	masked := addr.Mask(mask)
+	return cnet.IPNet{net.IPNet{IP: masked, Mask: mask}}
+}
+
+func ipToInt(ip cnet.IP) *big.Int {
+	if ip.To4() != nil {
+		return big.NewInt(0).SetBytes(ip.To4())
+	}
+	return big.NewInt(0).SetBytes(ip.To16())
+}
+
+func ipToOrdinal(ip cnet.IP, b allocationBlock) (int, error) {
+	ipInt := ipToInt(ip)
+	baseInt := ipToInt(cnet.IP{b.CIDR.IP})
+	ord := big.NewInt(0).Sub(ipInt, baseInt).Int64()
+	if ord < 0 || ord >= blockSize {
+		return 0, fmt.Errorf("IP %s not in block %s", ip, b.CIDR)
+	}
+	return int(ord), nil
 }

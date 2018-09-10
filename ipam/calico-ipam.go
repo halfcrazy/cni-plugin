@@ -83,6 +83,8 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if err != nil {
 		return err
 	}
+	// TODO: get reserved ips
+	reservedIPs := []cnet.IP{}
 
 	epIDs, err := utils.GetIdentifiers(args, nodename)
 	if err != nil {
@@ -176,12 +178,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 		fmt.Fprintf(os.Stderr, "Calico CNI IPAM handle=%s\n", handleID)
 		assignArgs := ipam.AutoAssignArgs{
-			Num4:      num4,
-			Num6:      num6,
-			HandleID:  &handleID,
-			Hostname:  nodename,
-			IPv4Pools: v4pools,
-			IPv6Pools: v6pools,
+			Num4:        num4,
+			Num6:        num6,
+			HandleID:    &handleID,
+			Hostname:    nodename,
+			IPv4Pools:   v4pools,
+			IPv6Pools:   v6pools,
+			ReservedIPs: reservedIPs,
 		}
 		logger.WithField("assignArgs", assignArgs).Info("Auto assigning IP")
 		assignedV4, assignedV6, err := calicoClient.IPAM().AutoAssign(ctx, assignArgs)
